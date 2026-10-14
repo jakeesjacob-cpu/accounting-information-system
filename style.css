@@ -1,0 +1,47 @@
+*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:#f5f7fb;color:#20242a}.topbar{background:#17324d;color:#fff;padding:15px 24px;display:flex;justify-content:space-between;align-items:center}.topbar nav{display:flex;gap:15px;flex-wrap:wrap}.topbar a{color:#fff;text-decoration:none}.topbar a:hover{text-decoration:underline}main{max-width:1200px;margin:25px auto;padding:0 18px}.login-page{min-height:100vh;display:grid;place-items:center}.login-card{width:min(430px,92vw);background:#fff;padding:30px;border-radius:12px;box-shadow:0 8px 30px #0001}.login-card h1{margin-top:0}.login-card form{display:grid;gap:10px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin:20px 0}.card,.panel{background:#fff;border:1px solid #e1e5ea;border-radius:10px;padding:20px}.card span{display:block;color:#667085}.card strong{font-size:30px;display:block;margin-top:8px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:18px;margin-bottom:18px}.panel h2{margin-top:0}input,select,textarea,button{font:inherit;padding:9px;border:1px solid #ccd2d9;border-radius:6px}textarea{min-height:90px;width:100%}button,.button{background:#17324d;color:#fff;border:0;cursor:pointer;text-decoration:none;display:inline-block;padding:9px 14px;border-radius:6px}.compact{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:15px}.compact input,.compact select{flex:1;min-width:120px}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border-bottom:1px solid #e5e7eb;padding:9px;text-align:left}th{background:#f8fafc}.notice,.alert{padding:12px;border-radius:7px;margin-bottom:15px}.notice{background:#e9f7ef}.alert{background:#fdecec;color:#a11}@media(max-width:700px){.topbar{align-items:flex-start;gap:12px;flex-direction:column}}
+
+/* ===== Admin dashboard (admin.php) — scoped to body.adm ===== */
+.adm{--navy:#0f2a43;--navy2:#16385a;--muted:#6b7686;--line:#e3e7ec;--gold:#c8963e;--green:#2f9e6e;--red:#c94b4b;font-family:"Segoe UI",Arial,sans-serif}
+.adm .app{display:flex;min-height:100vh}
+.adm .sidebar{width:230px;background:var(--navy);color:#dbe6f0;flex-shrink:0;padding:18px 0;position:sticky;top:0;height:100vh;overflow-y:auto}
+.adm .brand{padding:0 20px 18px;border-bottom:1px solid rgba(255,255,255,.12);margin-bottom:10px}
+.adm .b1{font-weight:700;font-size:15px;color:#fff}.adm .b2{font-size:11px;color:#9fb3c8;margin-top:2px}
+.adm .nav-item{display:flex;align-items:center;gap:10px;padding:10px 20px;font-size:13.5px;color:#c3d3e2;text-decoration:none;border-left:3px solid transparent}
+.adm .nav-item:hover{background:rgba(255,255,255,.06)}
+.adm .nav-item.active{background:rgba(255,255,255,.09);border-left-color:var(--gold);color:#fff;font-weight:600}
+.adm .nav-icon{width:18px;text-align:center}
+.adm .nav-sect{padding:14px 20px 4px;font-size:10.5px;letter-spacing:.03em;color:#7d93a8}
+.adm .main{flex:1;min-width:0}
+.adm header{display:flex;align-items:center;justify-content:space-between;padding:14px 26px;background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+.adm header h1{font-size:17px;margin:0}.adm header .sub{font-size:12px;color:var(--muted);margin-top:2px}
+.adm .hdr-right{display:flex;align-items:center;gap:16px}
+.adm .bell{font-size:17px;text-decoration:none}
+.adm .who{display:flex;align-items:center;gap:8px;font-size:13px}
+.adm .avatar{width:30px;height:30px;border-radius:50%;background:var(--gold);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px}
+.adm .role-pill{font-size:11px;color:var(--muted)}
+.adm .content{padding:22px 26px 40px}
+.adm .card .lbl{font-size:12px;color:var(--muted)}.adm .card .val{font-size:24px;font-weight:700;margin-top:4px}.adm .card .delta{font-size:11.5px;margin-top:6px}
+.adm .up{color:var(--green)}.adm .down{color:var(--red)}
+.adm .grid2{display:grid;grid-template-columns:1.4fr 1fr;gap:16px}
+.adm .panel{overflow-x:auto}.adm .panel h2{font-size:14.5px;margin:0 0 14px}
+.adm table{font-size:13px;min-width:480px}.adm th{font-size:11px;color:var(--muted)}
+.adm tr.total td{font-weight:700}
+.adm .badge{padding:2px 9px;border-radius:20px;font-size:11px;font-weight:600}
+.adm .b-active{background:#e5f5ee;color:var(--green)}.adm .b-disabled{background:#fdecec;color:var(--red)}.adm .b-pending{background:#fdf3e3;color:var(--gold)}
+.adm .bars{display:flex;align-items:flex-end;gap:10px;height:150px;margin-top:22px}
+.adm .bar{flex:1;background:linear-gradient(180deg,var(--navy2),var(--navy));border-radius:4px 4px 0 0;position:relative}
+.adm .bar span{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);font-size:10.5px;color:var(--muted);margin-bottom:3px}
+.adm .barlabels{display:flex;gap:10px;margin-top:6px}.adm .barlabels div{flex:1;text-align:center;font-size:10.5px;color:var(--muted)}
+.adm .log{font-size:12.5px;padding:9px 0;border-bottom:1px solid var(--line)}.adm .log:last-child{border-bottom:none}.adm .log .t{color:var(--muted);font-size:11px}
+.adm .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px}
+.adm .muted{color:var(--muted);font-size:13px}
+.adm button.primary{background:var(--navy);color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer}
+.adm button.secondary{background:#fff;color:#20242a;border:1px solid var(--line);padding:8px 14px;border-radius:6px;cursor:pointer}
+.adm button.linkbtn{background:none;color:var(--navy2);padding:0;text-decoration:underline}
+.adm dialog{border:none;border-radius:10px;padding:0;width:min(380px,92vw)}
+.adm dialog::backdrop{background:rgba(15,23,35,.45)}
+.adm .modal{padding:22px}.adm .modal h3{margin:0 0 14px;font-size:15px}
+.adm .field{margin-bottom:12px}.adm .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+.adm .field input,.adm .field select,.adm .field textarea{width:100%}
+.adm .modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+@media(max-width:820px){.adm .grid2{grid-template-columns:1fr}.adm .app{flex-direction:column}.adm .sidebar{width:100%;height:auto;position:relative}}
