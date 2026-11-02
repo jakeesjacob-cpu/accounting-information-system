@@ -28,19 +28,37 @@ function nav_config() {
     ];
 }
  
+// Number of notifications this user has not opened yet (never counts their own posts).
+function unread_notifications($u) {
+    global $pdo;
+    try {
+        $sql = "SELECT COUNT(*) FROM notifications n
+                WHERE n.notification_id > (SELECT COALESCE(last_seen_notification,0) FROM users WHERE user_id=?)
+                AND (n.created_by IS NULL OR n.created_by <> ?)
+                AND (n.recipient_id IS NULL OR n.recipient_id = ?)"
+             . ($u['role'] === 'Student' ? " AND n.audience <> 'All Faculty'" : '');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([(int)$u['user_id'], (int)$u['user_id'], (int)$u['user_id']]);
+        return (int)$stmt->fetchColumn();
+    } catch (Throwable $e) { return 0; }   // column/table missing: just show no badge
+}
+
 function layout_start($active, $title, $sub = '', $eyebrow = '') {
     $u = $_SESSION['user'];
+    $unread = unread_notifications($u);
     ?><!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#16233F">
 <title><?=h($title)?> — Accounting Information System</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,500;8..60,600;8..60,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="app.css?v=<?=@filemtime(__DIR__ . '/app.css')?>">
 </head><body>
 <div id="app">
+  <div id="navOverlay"></div>
   <aside id="sidebar">
     <div class="brand">
       <div class="mark">Accounting Information System</div>
@@ -52,7 +70,7 @@ function layout_start($active, $title, $sub = '', $eyebrow = '') {
         if (!$items) continue; ?>
       <div class="tab-group-label"><?=h($g[0])?></div>
 <?php foreach ($items as $i): ?>
-      <a class="navbtn<?=$i[0] === $active ? ' active' : ''?>" href="<?=h($i[3])?>"><span class="ico"><?=$i[2]?></span><?=h($i[1])?></a>
+      <a class="navbtn<?=$i[0] === $active ? ' active' : ''?>" href="<?=h($i[3])?>"><span class="ico"><?=$i[2]?></span><?=h($i[1])?><?php if ($i[0] === 'notifications' && $unread > 0): ?><span class="nav-badge"><?=$unread > 99 ? '99+' : $unread?></span><?php endif; ?></a>
 <?php endforeach; endforeach; ?>
     </nav>
     <div class="role-switch">
@@ -65,7 +83,7 @@ function layout_start($active, $title, $sub = '', $eyebrow = '') {
   </aside>
   <main id="main">
     <div class="mobile-topbar">
-      <button id="menuBtn" type="button" aria-label="Open menu">☰ Menu</button>
+      <button id="menuBtn" type="button" aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">☰<?php if ($unread > 0): ?><span class="nav-badge"><?=$unread > 99 ? '99+' : $unread?></span><?php endif; ?></button>
       <strong style="font-family:'Source Serif 4',serif;"><?=h($title)?></strong>
     </div>
     <header class="pagehead">
@@ -84,8 +102,37 @@ function layout_end() { ?>
   </main>
 </div>
 <script>
-document.getElementById('menuBtn').onclick = function(){ document.getElementById('sidebar').classList.toggle('open'); };
-document.querySelectorAll('#sidebar a').forEach(function(a){ a.addEventListener('click', function(){ document.getElementById('sidebar').classList.remove('open'); }); });
+(function(){
+  var sb  = document.getElementById('sidebar');
+  var ov  = document.getElementById('navOverlay');
+  var btn = document.getElementById('menuBtn');
+
+  function setOpen(open){
+    sb.classList.toggle('open', open);
+    ov.classList.toggle('show', open);
+    document.body.classList.toggle('nav-open', open);
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  btn.addEventListener('click', function(){ setOpen(!sb.classList.contains('open')); });
+  ov.addEventListener('click', function(){ setOpen(false); });
+  document.addEventListener('keydown', function(e){ if (e.key === 'Escape') setOpen(false); });
+  sb.querySelectorAll('a').forEach(function(a){ a.addEventListener('click', function(){ setOpen(false); }); });
+
+  // On phones, tables turn into stacked cards. Each cell is labelled from its column heading.
+  document.querySelectorAll('table').forEach(function(t){
+    var heads = [].map.call(t.querySelectorAll('thead th'), function(th){ return th.textContent.trim(); });
+    t.querySelectorAll('tbody tr').forEach(function(tr){
+      var i = 0;
+      [].forEach.call(tr.children, function(td){
+        if (td.tagName !== 'TD') return;
+        var span = td.colSpan || 1;
+        if (span === 1 && heads[i]) td.setAttribute('data-label', heads[i]);
+        i += span;
+      });
+    });
+    t.classList.add('stackable');
+  });
+})();
 </script>
 </body></html>
 <?php }

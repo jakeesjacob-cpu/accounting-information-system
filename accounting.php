@@ -3,10 +3,47 @@ require 'config.php'; require 'layout.php'; require_login();
 $role    = $_SESSION['user']['role'];
 $userId  = (int)$_SESSION['user']['user_id'];
 $canEdit = in_array($role, ['Admin','Faculty'], true);
-$canAdd  = in_array($role, ['Admin','Faculty','Student'], true);
+$canAdd  = in_array($role, ['Admin','Student'], true);   // Faculty no longer add/edit/delete accounts: they check them
+$canJournal = in_array($role, ['Admin','Student'], true); // Faculty cannot add/delete entries...
+$canReview  = in_array($role, ['Admin','Faculty'], true); // ...but can check (review) student work
 $v = (($_POST['v'] ?? $_GET['v'] ?? 'coa') === 'journal') ? 'journal' : 'coa';
  
 // Normal balance side for each account type ("Debit/Credit Nature" column).
+// True when chart_of_accounts has the created_by (owner) column.
+function coa_has_owner(PDO $pdo) {
+    static $has = null;
+    if ($has === null) { try { $has = (bool)$pdo->query("SHOW COLUMNS FROM chart_of_accounts LIKE 'created_by'")->fetch(); } catch (Throwable $e) { $has = false; } }
+    return $has;
+}
+// Chart of accounts: every student builds their own accounts. A student can change only their own;
+// Admin can change any; Faculty cannot change accounts - they review (check) them instead.
+function coa_can_manage(PDO $pdo, $id, $role, $uid) {
+    if ($role === 'Admin') return true;
+    if ($role !== 'Student' || $uid <= 0 || !coa_has_owner($pdo)) return false;
+    $q = $pdo->prepare("SELECT created_by FROM chart_of_accounts WHERE account_id=?"); $q->execute([$id]);
+    return (int)$q->fetchColumn() === $uid;
+}
+function coa_row_manageable($a) {
+    global $role, $userId;
+    return $role === 'Admin' || ($role === 'Student' && $userId > 0 && (int)($a['created_by'] ?? 0) === $userId);
+}
+// Sends a private notification to one student. Returns '' on success or the database error text.
+function notify_student(PDO $pdo, $studentId, $message, $creatorId) {
+    try {
+        $pdo->prepare("INSERT INTO notifications(audience,message,created_by,recipient_id) VALUES('All Students',?,?,?)")
+            ->execute([$message, $creatorId, (int)$studentId]);
+        return '';
+    } catch (PDOException $e) { return $e->getMessage(); }
+}
+// Dropdown data for the faculty's Section / Group / Student filter.
+function review_filter_lists(PDO $pdo, $fSec, $fGrp) {
+    $secs = $pdo->query("SELECT s.section_id, s.section_name, c.course_code FROM sections s JOIN courses c ON c.course_id=s.course_id ORDER BY c.course_code, s.section_name")->fetchAll();
+    $q = $pdo->prepare("SELECT g.group_id, g.group_name, s.section_name FROM student_groups g JOIN sections s ON s.section_id=g.section_id WHERE (?=0 OR g.section_id=?) ORDER BY s.section_name, g.group_name");
+    $q->execute([$fSec, $fSec]); $grps = $q->fetchAll();
+    $q = $pdo->prepare("SELECT u.user_id, u.name FROM users u JOIN enrollments e ON e.student_id=u.user_id WHERE u.role='Student' AND (?=0 OR e.section_id=?) AND (?=0 OR e.group_id=?) ORDER BY u.name");
+    $q->execute([$fSec, $fSec, $fGrp, $fGrp]); $stus = $q->fetchAll();
+    return [$secs, $grps, $stus];
+}
 function normal_balance($type) {
     return in_array($type, ['Asset', 'Expense'], true) ? 'Debit' : 'Credit';
 }
@@ -16,17 +53,70 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
     try {
         if ($action === 'add_account') {
-            require_role(['Admin','Faculty','Student']);
-            $stmt = $pdo->prepare("INSERT INTO chart_of_accounts(account_code,account_name,account_type,description) VALUES(?,?,?,?)");
-            $stmt->execute([trim($_POST['code']), trim($_POST['name']), $_POST['type'], trim($_POST['description'] ?? '')]);
+            require_role(['Admin','Student']);
+            if (coa_has_owner($pdo)) {
+                $stmt = $pdo->prepare("INSERT INTO chart_of_accounts(account_code,account_name,account_type,description,created_by) VALUES(?,?,?,?,?)");
+                $stmt->execute([trim($_POST['code']), trim($_POST['name']), $_POST['type'], trim($_POST['description'] ?? ''), $userId]);
+            } else {
+                $stmt = $pdo->prepare("INSERT INTO chart_of_accounts(account_code,account_name,account_type,description) VALUES(?,?,?,?)");
+                $stmt->execute([trim($_POST['code']), trim($_POST['name']), $_POST['type'], trim($_POST['description'] ?? '')]);
+            }
             audit($pdo, 'Added chart of account');
             flash('ok', 'Account added.');
-        } elseif ($action === 'delete_account') {
+        } elseif ($action === 'review_account') {
             require_role(['Admin','Faculty']);
+            $id = (int)($_POST['account_id'] ?? 0);
+            $status = $_POST['review_status'] ?? ''; $comment = trim($_POST['review_comment'] ?? '');
+            $q = $pdo->prepare("SELECT account_code, account_name, created_by FROM chart_of_accounts WHERE account_id=?"); $q->execute([$id]); $acc = $q->fetch();
+            if (!$acc) flash('warn', 'Account not found.');
+            elseif (empty($acc['created_by'])) flash('warn', 'Shared starter accounts do not belong to a student, so they are not reviewed.');
+            elseif (!in_array($status, ['Approved','Needs Revision','Pending'], true)) flash('warn', 'Choose a review result.');
+            elseif ($status === 'Needs Revision' && $comment === '') flash('warn', 'Add a comment so the student knows what to fix.');
+            else {
+                $pdo->prepare("UPDATE chart_of_accounts SET review_status=?, review_comment=?, reviewed_by=?, reviewed_at=? WHERE account_id=?")
+                    ->execute([$status, $comment !== '' ? $comment : null, $userId, $status === 'Pending' ? null : date('Y-m-d H:i:s'), $id]);
+                audit($pdo, "Reviewed chart of account #$id: $status");
+                if ($status === 'Pending') flash('ok', 'Review cleared.');
+                else {
+                    $msg = 'Your chart of accounts entry "' . $acc['account_code'] . ' - ' . $acc['account_name'] . '" was '
+                         . ($status === 'Approved' ? 'APPROVED' : 'marked NEEDS REVISION') . ' by ' . $_SESSION['user']['name'] . '.'
+                         . ($comment !== '' ? "\nComment: " . $comment : '');
+                    $err = notify_student($pdo, (int)$acc['created_by'], $msg, $userId);
+                    if ($err === '') flash('ok', 'Review saved and sent to the student.');
+                    else flash('warn', 'Review saved, but the student could not be notified: ' . $err);
+                }
+            }
+        } elseif ($action === 'edit_account') {
+            require_role(['Admin','Student']);
+            $id = (int)($_POST['account_id'] ?? 0);
+            $code = trim($_POST['code'] ?? ''); $name = trim($_POST['name'] ?? '');
+            $type = $_POST['type'] ?? ''; $desc = trim($_POST['description'] ?? '');
+            if (!coa_can_manage($pdo, $id, $role, $userId)) {
+                flash('warn', 'You are not allowed to change accounts.');
+            } elseif ($code === '' || $name === '' || !in_array($type, ['Asset','Liability','Equity','Revenue','Expense'], true)) {
+                flash('warn', 'Enter an account code, name and a valid type.');
+            } else {
+                $cur = $pdo->prepare("SELECT account_type FROM chart_of_accounts WHERE account_id=?"); $cur->execute([$id]);
+                $oldType = $cur->fetchColumn();
+                $used = $pdo->prepare("SELECT COUNT(*) FROM journal_lines WHERE account_id=?"); $used->execute([$id]);
+                if ($oldType === false) flash('warn', 'Account not found.');
+                elseif ($oldType !== $type && $used->fetchColumn() > 0) flash('warn', 'Cannot change the type — the account is already used in journal entries.');
+                else {
+                    $pdo->prepare("UPDATE chart_of_accounts SET account_code=?, account_name=?, account_type=?, description=? WHERE account_id=?")
+                        ->execute([$code, $name, $type, $desc, $id]);
+                    try { $pdo->prepare("UPDATE chart_of_accounts SET review_status='Pending', review_comment=NULL, reviewed_by=NULL, reviewed_at=NULL WHERE account_id=?")->execute([$id]); }
+                    catch (PDOException $e2) { /* review columns not added yet */ }
+                    audit($pdo, 'Edited chart of account'); flash('ok', 'Account updated.');
+                }
+            }
+        } elseif ($action === 'delete_account') {
+            require_role(['Admin','Student']);
             $id = (int)($_POST['account_id'] ?? 0);
             $used = $pdo->prepare("SELECT COUNT(*) FROM journal_lines WHERE account_id=?");
             $used->execute([$id]);
-            if ($used->fetchColumn() > 0) {
+            if (!coa_can_manage($pdo, $id, $role, $userId)) {
+                flash('warn', 'You are not allowed to remove accounts.');
+            } elseif ($used->fetchColumn() > 0) {
                 flash('warn', 'Cannot remove — account is used in journal entries.');
             } else {
                 $pdo->prepare("DELETE FROM chart_of_accounts WHERE account_id=?")->execute([$id]);
@@ -34,6 +124,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 flash('ok', 'Account removed.');
             }
         } elseif ($action === 'delete_entry') {
+            require_role(['Admin','Student']); // Faculty is view-only
             // Students may delete only their own entries; Admin/Faculty may delete any.
             $id = (int)($_POST['entry_id'] ?? 0);
             $own = $pdo->prepare("SELECT student_id FROM journal_entries WHERE entry_id=?");
@@ -51,9 +142,81 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $pdo->commit();
                 } catch (Throwable $e) { $pdo->rollBack(); throw $e; }
                 audit($pdo, 'Deleted a journal entry');
+                reset_reports_if_empty($pdo); // nothing left -> reset Ledger / Trial Balance / Financial Reports
                 flash('ok', 'Journal entry deleted.');
             }
+        } elseif ($action === 'edit_entry') {
+            require_role(['Admin','Student']); // Faculty reviews entries but does not change them
+            $id = (int)($_POST['entry_id'] ?? 0);
+            $own = $pdo->prepare("SELECT student_id FROM journal_entries WHERE entry_id=?"); $own->execute([$id]); $owner = $own->fetchColumn();
+            $title = trim($_POST['title'] ?? ''); $expl = trim($_POST['explanation'] ?? '');
+            $dateRaw = trim($_POST['entry_date'] ?? ''); $dt = DateTime::createFromFormat('Y-m-d', $dateRaw);
+            if ($owner === false) flash('warn', 'Journal entry not found.');
+            elseif ($role === 'Student' && (int)$owner !== $userId) flash('warn', 'You can only edit your own journal entries.');
+            elseif ($title === '') flash('warn', 'Enter an entry title.');
+            elseif (!$dt || $dt->format('Y-m-d') !== $dateRaw) flash('warn', 'Please enter a valid date as DD/MM/YYYY.');
+            else {
+                $lines = []; $bad = '';
+                foreach (($_POST['account'] ?? []) as $i => $raw) {
+                    $dv = (float)str_replace(',', '', trim((string)($_POST['debit'][$i] ?? '')));
+                    $cv = (float)str_replace(',', '', trim((string)($_POST['credit'][$i] ?? '')));
+                    if (trim((string)$raw) === '' && $dv == 0 && $cv == 0) continue;
+                    $aid = find_account($pdo, $raw, (int)$owner);
+                    if ($aid === null) { $bad = 'Account not found: ' . trim((string)$raw) . '. Use a code or title from the Chart of Accounts.'; break; }
+                    $lines[] = [$aid, $dv, $cv];
+                }
+                if ($bad !== '') flash('warn', $bad);
+                elseif (count($lines) < 2) flash('warn', 'A journal entry needs at least two lines.');
+                else {
+                    $valid = journal_is_balanced(array_column($lines, 1), array_column($lines, 2));
+                    $pdo->beginTransaction();
+                    try {
+                        $pdo->prepare("UPDATE journal_entries SET entry_date=?, description=?, ai_validation_status=? WHERE entry_id=?")
+                            ->execute([$dt->format('Y-m-d'), $title . ($expl !== '' ? ' ‖ ' . $expl : ''), $valid ? 'Valid' : 'Invalid', $id]);
+                        $pdo->prepare("DELETE FROM journal_lines WHERE entry_id=?")->execute([$id]);
+                        $ins = $pdo->prepare("INSERT INTO journal_lines(entry_id,account_id,debit_amount,credit_amount) VALUES(?,?,?,?)");
+                        foreach ($lines as $l) $ins->execute([$id, $l[0], $l[1], $l[2]]);
+                        $pdo->commit();
+                    } catch (Throwable $e) { $pdo->rollBack(); throw $e; }
+                    try { // an edited entry goes back to "not yet reviewed" so faculty check it again
+                        $pdo->prepare("UPDATE journal_entries SET review_status='Pending', review_comment=NULL, reviewed_by=NULL, reviewed_at=NULL WHERE entry_id=?")->execute([$id]);
+                    } catch (PDOException $e2) { /* review columns not added yet */ }
+                    audit($pdo, 'Edited a journal entry: ' . ($valid ? 'Valid' : 'Invalid'));
+                    if ($valid) flash('ok', 'Journal entry updated and validated: debit equals credit.');
+                    else flash('warn', 'Entry updated but saved as Unbalanced: debit and credit totals must be equal.');
+                }
+            }
+        } elseif ($action === 'review_entry') {
+            require_role(['Admin','Faculty']);
+            $id      = (int)($_POST['entry_id'] ?? 0);
+            $status  = $_POST['review_status'] ?? '';
+            $comment = trim($_POST['review_comment'] ?? '');
+            $chk = $pdo->prepare("SELECT student_id, entry_date, description FROM journal_entries WHERE entry_id=?"); $chk->execute([$id]);
+            $ent = $chk->fetch();
+            if (!$ent) flash('warn', 'Journal entry not found.');
+            elseif (!in_array($status, ['Approved','Needs Revision','Pending'], true)) flash('warn', 'Choose a review result.');
+            elseif ($status === 'Needs Revision' && $comment === '') flash('warn', 'Add a comment so the student knows what to fix.');
+            else {
+                $pdo->prepare("UPDATE journal_entries SET review_status=?, review_comment=?, reviewed_by=?, reviewed_at=? WHERE entry_id=?")
+                    ->execute([$status, $comment !== '' ? $comment : null, $userId, $status === 'Pending' ? null : date('Y-m-d H:i:s'), $id]);
+                audit($pdo, "Reviewed journal entry #$id: $status");
+                $sent = false; $notifErr = '';
+                if ($status !== 'Pending') {   // tell the student the result (shows on their Notifications page)
+                    try {
+                        $etitle = explode(' ‖ ', (string)$ent['description'], 2)[0];
+                        $msg = 'Your journal entry "' . $etitle . '" dated ' . date('d/m/Y', strtotime($ent['entry_date']))
+                             . ($status === 'Approved' ? ' was APPROVED' : ' NEEDS REVISION') . ' by ' . $_SESSION['user']['name'] . '.'
+                             . ($comment !== '' ? "\nComment: " . $comment : '');
+                        $pdo->prepare("INSERT INTO notifications(audience,message,created_by,recipient_id) VALUES('All Students',?,?,?)")
+                            ->execute([$msg, $userId, (int)$ent['student_id']]);
+                        $sent = true;
+                    } catch (PDOException $ne) { $notifErr = $ne->getMessage(); /* the review itself is still saved */ }
+                }
+                flash($sent || $status === 'Pending' ? 'ok' : 'warn',
+                      $status === 'Pending' ? 'Review cleared.' : ($sent ? 'Review saved and sent to the student.' : 'Review saved, but the student could not be notified: ' . $notifErr));
+            }
         } elseif ($action === 'journal') {
+            require_role(['Admin','Student']); // Faculty is view-only
             // Header textboxes (kept per student for the General Journal heading)
             $_SESSION['je_company'] = trim($_POST['company'] ?? '');
             $_SESSION['je_report']  = trim($_POST['report_title'] ?? '');
@@ -84,98 +247,207 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             else flash('warn', $bad . ' of ' . max($posted, $bad) . ' entries need attention. ' . $err);
         }
     } catch (PDOException $e) {
-        flash('warn', $e->getCode() === '23000' ? 'That account code already exists.' : 'Database error.');
+        flash('warn', $e->getCode() === '23000' ? 'That account code or name is already taken. For every student to have their own copy of each account, run the latest migration_journal_review.sql.'
+            : (in_array($action, ['review_entry','review_account'], true) ? 'Could not save the review. Run migration_journal_review.sql first.' : 'Database error: ' . $e->getMessage()));
     }
-    header('Location: accounting.php?v=' . $v); exit;
+    $qs = '';   // keep the faculty's section / group / student filter after saving
+    foreach (['sec','grp','stu'] as $k) if ((int)($_POST[$k] ?? 0) > 0) $qs .= '&' . $k . '=' . (int)$_POST[$k];
+    header('Location: accounting.php?v=' . $v . $qs); exit;
 }
  
-$accounts = $pdo->query("SELECT * FROM chart_of_accounts ORDER BY account_code")->fetchAll();
- 
+// Accounts the Journal Entries page may use: a student's own accounts plus shared starter accounts; staff see all.
+$accounts = [];
+try {
+    if ($role === 'Student' && coa_has_owner($pdo)) {
+        $q = $pdo->prepare("SELECT * FROM chart_of_accounts WHERE created_by=? OR created_by IS NULL ORDER BY account_code"); $q->execute([$userId]); $accounts = $q->fetchAll();
+    } else $accounts = $pdo->query("SELECT * FROM chart_of_accounts ORDER BY account_code")->fetchAll();
+} catch (PDOException $e) { $accounts = []; }
+
 if ($v === 'coa') {
-    layout_start('coa', 'Chart of Accounts', 'All accounts in one organized table.');
+    $fSec = (int)($_GET['sec'] ?? 0); $fGrp = (int)($_GET['grp'] ?? 0); $fStu = (int)($_GET['stu'] ?? 0);
+    $fSections = $fGroups = $fStudents = []; $coaRows = []; $me = ['section_name' => '', 'group_name' => ''];
+    try {
+        if ($role === 'Student') {
+            $q = $pdo->prepare("SELECT sc.section_name, g.group_name FROM enrollments e JOIN sections sc ON sc.section_id=e.section_id LEFT JOIN student_groups g ON g.group_id=e.group_id WHERE e.student_id=? LIMIT 1");
+            $q->execute([$userId]); $me = $q->fetch() ?: $me;
+            if (coa_has_owner($pdo)) {
+                $q = $pdo->prepare("SELECT * FROM chart_of_accounts WHERE created_by=? OR created_by IS NULL ORDER BY (created_by IS NULL), account_code"); $q->execute([$userId]); $coaRows = $q->fetchAll();
+            } else $coaRows = $accounts;
+        } else {
+            [$fSections, $fGroups, $fStudents] = review_filter_lists($pdo, $fSec, $fGrp);
+            $w = []; $pr = [];
+            if ($fStu)     { $w[] = 'a.created_by=?'; $pr[] = $fStu; }
+            elseif ($fGrp) { $w[] = 'e.group_id=?';   $pr[] = $fGrp; }
+            elseif ($fSec) { $w[] = 'e.section_id=?'; $pr[] = $fSec; }
+            $q = $pdo->prepare("SELECT a.*, u.name owner_name, sc.section_name, g.group_name
+                FROM chart_of_accounts a LEFT JOIN users u ON u.user_id=a.created_by
+                LEFT JOIN enrollments e ON e.student_id=a.created_by LEFT JOIN sections sc ON sc.section_id=e.section_id
+                LEFT JOIN student_groups g ON g.group_id=e.group_id"
+                . ($w ? ' WHERE ' . implode(' AND ', $w) : '') . " ORDER BY (a.created_by IS NULL), u.name, a.account_code");
+            $q->execute($pr); $coaRows = $q->fetchAll();
+        }
+    } catch (PDOException $e) {
+        flash('warn', 'Some filters are unavailable (' . $e->getMessage() . '). Run migration_journal_review.sql.');
+        $coaRows = $pdo->query("SELECT * FROM chart_of_accounts ORDER BY account_code")->fetchAll();
+    }
+    $coaGroups = []; $pendingAcc = 0;
+    foreach ($coaRows as $a) {
+        $k = (int)($a['created_by'] ?? 0);
+        if (!isset($coaGroups[$k])) {
+            $coaGroups[$k] = $role === 'Student' && $k === $userId
+                ? ['name' => $_SESSION['user']['name'], 'section' => $me['section_name'] ?? '', 'group' => $me['group_name'] ?? '', 'rows' => []]
+                : ['name' => $a['owner_name'] ?? '', 'section' => $a['section_name'] ?? '', 'group' => $a['group_name'] ?? '', 'rows' => []];
+        }
+        $coaGroups[$k]['rows'][] = $a;
+        if ($k && (empty($a['review_status']) || $a['review_status'] === 'Pending')) $pendingAcc++;
+    }
+    $subtitle = $role === 'Faculty' ? "Check each student's chart of accounts, one student at a time."
+              : ($role === 'Student' ? 'Add the accounts you will use in your journal entries. Your faculty will check them.' : 'Every student keeps their own chart of accounts.');
+    layout_start('coa', 'Chart of Accounts', $subtitle);
 ?>
+
+<?php if ($canReview): ?>
+<form method="get" style="margin-bottom:12px">
+  <input type="hidden" name="v" value="coa">
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+    <div style="min-width:170px"><label class="field-label">Section</label>
+      <select name="sec" onchange="this.form.grp.value=0;this.form.stu.value=0;this.form.submit()">
+        <option value="0">All sections</option>
+        <?php foreach ($fSections as $s): ?><option value="<?=(int)$s['section_id']?>"<?=$fSec === (int)$s['section_id'] ? ' selected' : ''?>><?=h($s['section_name'] . ' (' . $s['course_code'] . ')')?></option><?php endforeach; ?>
+      </select></div>
+    <div style="min-width:170px"><label class="field-label">Group</label>
+      <select name="grp" onchange="this.form.stu.value=0;this.form.submit()">
+        <option value="0">All groups</option>
+        <?php foreach ($fGroups as $g): ?><option value="<?=(int)$g['group_id']?>"<?=$fGrp === (int)$g['group_id'] ? ' selected' : ''?>><?=h($g['section_name'] . ' — ' . $g['group_name'])?></option><?php endforeach; ?>
+      </select></div>
+    <div style="min-width:170px"><label class="field-label">Student</label>
+      <select name="stu" onchange="this.form.submit()">
+        <option value="0">All students</option>
+        <?php foreach ($fStudents as $s): ?><option value="<?=(int)$s['user_id']?>"<?=$fStu === (int)$s['user_id'] ? ' selected' : ''?>><?=h($s['name'])?></option><?php endforeach; ?>
+      </select></div>
+    <?php if ($fSec || $fGrp || $fStu): ?><a class="btn ghost small" href="accounting.php?v=coa">Clear filter</a><?php endif; ?>
+  </div>
+</form>
+<?php endif; ?>
 
 <div class="flex-between" style="margin-bottom:12px">
     <span class="muted small">
-        <?=count($accounts)?> accounts · as of <?=h(date('F d, Y'))?>
+        <?=count($coaRows)?> accounts<?php if ($canReview): ?> · <?=$pendingAcc?> not yet reviewed<?php endif; ?> · as of <?=h(date('F d, Y'))?>
     </span>
-
     <?php if ($canAdd): ?>
-        <button class="btn brass" onclick="document.getElementById('accDlg').showModal()">
-            + New account
-        </button>
+        <button class="btn brass" onclick="document.getElementById('accDlg').showModal()">+ New account</button>
     <?php endif; ?>
 </div>
 
+<?php if (!$coaGroups): ?><div class="empty"><?=$role === 'Student' ? 'You have not added any accounts yet. Use “+ New account” to build your chart of accounts.' : 'No accounts to show.'?></div><?php endif; ?>
+
+<?php foreach ($coaGroups as $k => $grp): ?>
 <section class="block">
-
-    <?php table_open(
-        ['Code','Account Name','Type','Debit/Credit Nature','Description','Action'],
-        [0,0,0,0,0,0]
-    ); ?>
-
-    <?php foreach ($accounts as $a): ?>
-
-        <tr>
-            <td class="num">
-                <?=h($a['account_code'])?>
-            </td>
-
-            <td>
-                <?=h($a['account_name'])?>
-            </td>
-
-            <td>
-                <?=h($a['account_type'])?>
-            </td>
-
-            <td>
-                <?=h(normal_balance($a['account_type']))?>
-            </td>
-
-            <td>
-                <?=h($a['description'] ?? '')?>
-            </td>
-
-            <td style="width:110px">
-                <?php if ($canEdit): ?>
-
-                    <form method="post"
-                          onsubmit="return confirm('Remove this account?')">
-
-                        <input type="hidden"
-                               name="csrf"
-                               value="<?=h(csrf())?>">
-
-                        <input type="hidden"
-                               name="action"
-                               value="delete_account">
-
-                        <input type="hidden"
-                               name="v"
-                               value="coa">
-
-                        <input type="hidden"
-                               name="account_id"
-                               value="<?=(int)$a['account_id']?>">
-
-                        <button class="btn ghost small">
-                            Remove
-                        </button>
-
-                    </form>
-
-                <?php endif; ?>
-            </td>
-        </tr>
-
-    <?php endforeach; ?>
-
-    <?php table_close(6); ?>
-
+  <div style="text-align:left;margin:6px 0 6px;line-height:1.6">
+    <?php if ($k): ?>
+      <div><b>Name:</b> <?=h($grp['name'])?></div>
+      <div><b>Section:</b> <?=h($grp['section'] !== '' ? $grp['section'] : 'Not enlisted')?><?php if ($grp['group'] !== ''): ?> &nbsp;·&nbsp; <b>Group:</b> <?=h($grp['group'])?><?php endif; ?></div>
+    <?php else: ?>
+      <div><b>Starter accounts</b> <span class="small muted">— shared, not reviewed</span></div>
+    <?php endif; ?>
+  </div>
+  <?php table_open(['Code','Account Name','Type','Debit/Credit Nature','Description','Review','Action'], [0,0,0,0,0,0,0]); ?>
+  <?php foreach ($grp['rows'] as $a): ?>
+    <tr>
+      <td class="num"><?=h($a['account_code'])?></td>
+      <td><?=h($a['account_name'])?></td>
+      <td><?=h($a['account_type'])?></td>
+      <td><?=h(normal_balance($a['account_type']))?></td>
+      <td><?=h($a['description'] ?? '')?></td>
+      <td><?=$k ? review_pill($a['review_status'] ?? '') : '<span class="small muted">—</span>'?></td>
+      <td style="white-space:nowrap">
+        <?php if ($canReview && $k): ?>
+          <button type="button" class="btn brass small"
+                  data-id="<?=(int)$a['account_id']?>" data-status="<?=h($a['review_status'] ?? 'Pending')?>" data-comment="<?=h($a['review_comment'] ?? '')?>"
+                  data-label="<?=h($a['account_code'] . ' - ' . $a['account_name'])?>" data-student="<?=h($grp['name'])?>"
+                  onclick="openAcctReview(this)">Review</button>
+        <?php endif; ?>
+        <?php if (coa_row_manageable($a)): ?>
+          <button type="button" class="btn ghost small"
+                  data-id="<?=(int)$a['account_id']?>" data-code="<?=h($a['account_code'])?>" data-name="<?=h($a['account_name'])?>"
+                  data-type="<?=h($a['account_type'])?>" data-desc="<?=h($a['description'] ?? '')?>"
+                  onclick="editAccount(this)">Edit</button>
+          <form method="post" style="display:inline" onsubmit="return confirm('Remove this account?')">
+            <input type="hidden" name="csrf" value="<?=h(csrf())?>"><input type="hidden" name="action" value="delete_account">
+            <input type="hidden" name="v" value="coa"><input type="hidden" name="account_id" value="<?=(int)$a['account_id']?>">
+            <button class="btn ghost small">Remove</button>
+          </form>
+        <?php endif; ?>
+      </td>
+    </tr>
+    <?php if (!empty($a['review_comment'])): ?>
+    <tr><td></td><td colspan="6"><b>Faculty feedback:</b> <?=nl2br(h($a['review_comment']))?></td></tr>
+    <?php endif; ?>
+  <?php endforeach; ?>
+  <?php table_close(7); ?>
 </section>
+<?php endforeach; ?>
+
+<?php if ($canReview): ?>
+<dialog id="acctReviewDlg" class="modal"><h3>Review account</h3>
+<form method="post" class="form-grid cols-1">
+  <input type="hidden" name="csrf" value="<?=h(csrf())?>"><input type="hidden" name="action" value="review_account"><input type="hidden" name="v" value="coa">
+  <input type="hidden" name="account_id" id="raId">
+  <input type="hidden" name="sec" value="<?=$fSec?>"><input type="hidden" name="grp" value="<?=$fGrp?>"><input type="hidden" name="stu" value="<?=$fStu?>">
+  <p class="small muted" style="margin:0">Student: <b id="raStudent"></b><br>Account: <b id="raLabel"></b></p>
+  <div><label class="field-label">Result</label>
+    <select name="review_status" id="raStatus">
+      <option value="Approved">Approved — account is correct</option>
+      <option value="Needs Revision">Needs revision — send back to student</option>
+      <option value="Pending">Not yet reviewed (clear review)</option>
+    </select></div>
+  <div><label class="field-label">Comment (required when sending back)</label><textarea name="review_comment" id="raComment" placeholder="e.g. Wrong account type."></textarea></div>
+  <div class="actions"><button type="button" class="btn ghost" onclick="this.closest('dialog').close()">Cancel</button><button class="btn brass">Save review</button></div>
+</form></dialog>
+<script>
+function openAcctReview(b){
+  document.getElementById('raId').value = b.dataset.id;
+  document.getElementById('raStudent').textContent = b.dataset.student;
+  document.getElementById('raLabel').textContent = b.dataset.label;
+  document.getElementById('raStatus').value = b.dataset.status || 'Pending';
+  document.getElementById('raComment').value = b.dataset.comment || '';
+  document.getElementById('acctReviewDlg').showModal();
+}
+</script>
+<?php endif; ?>
 
 <?php if ($canAdd): ?>
+
+<dialog id="editAccDlg" class="modal">
+    <h3>Edit Account</h3>
+    <form method="post" class="form-grid cols-1">
+        <input type="hidden" name="csrf" value="<?=h(csrf())?>">
+        <input type="hidden" name="action" value="edit_account">
+        <input type="hidden" name="v" value="coa">
+        <input type="hidden" name="account_id" id="eaId">
+        <div><label class="field-label">Account Code</label><input name="code" id="eaCode" required></div>
+        <div><label class="field-label">Account Name</label><input name="name" id="eaName" required></div>
+        <div><label class="field-label">Type</label>
+            <select name="type" id="eaType">
+                <option>Asset</option><option>Liability</option><option>Equity</option><option>Revenue</option><option>Expense</option>
+            </select></div>
+        <div><label class="field-label">Description</label><input name="description" id="eaDesc" placeholder="Optional"></div>
+        <div class="actions">
+            <button type="button" class="btn ghost" onclick="this.closest('dialog').close()">Cancel</button>
+            <button class="btn brass">Save changes</button>
+        </div>
+    </form>
+</dialog>
+<script>
+function editAccount(b){
+  document.getElementById('eaId').value   = b.dataset.id;
+  document.getElementById('eaCode').value = b.dataset.code;
+  document.getElementById('eaName').value = b.dataset.name;
+  document.getElementById('eaType').value = b.dataset.type;
+  document.getElementById('eaDesc').value = b.dataset.desc;
+  document.getElementById('editAccDlg').showModal();
+}
+</script>
 
 <dialog id="accDlg" class="modal">
 
@@ -257,10 +529,46 @@ if ($v === 'coa') {
 }
  
 // ---------- Journal Entries ----------
-$entries = recent_journal_entries($pdo, 50, $role === 'Student' ? $userId : null);
+$fSec = (int)($_GET['sec'] ?? 0); $fGrp = (int)($_GET['grp'] ?? 0); $fStu = (int)($_GET['stu'] ?? 0);
+$fSections = $fGroups = $fStudents = [];
+{
+    // Admin / Faculty: all entries, optionally narrowed to one student, one group or one section.
+    try {
+        $w = []; $p = [];
+        if ($role === 'Student') { $w[] = 'j.student_id=?'; $p[] = $userId; }
+        elseif ($fStu)  { $w[] = 'j.student_id=?'; $p[] = $fStu; }
+        elseif ($fGrp)  { $w[] = 'e.group_id=?';   $p[] = $fGrp; }
+        elseif ($fSec)  { $w[] = 'e.section_id=?'; $p[] = $fSec; }
+        $st = $pdo->prepare("SELECT j.*, u.name, sc.section_name, g.group_name,
+                (SELECT COALESCE(SUM(l.debit_amount),0) FROM journal_lines l WHERE l.entry_id=j.entry_id) AS total_debit
+            FROM journal_entries j JOIN users u ON u.user_id=j.student_id
+            LEFT JOIN enrollments e ON e.student_id=j.student_id
+            LEFT JOIN sections sc ON sc.section_id=e.section_id
+            LEFT JOIN student_groups g ON g.group_id=e.group_id"
+            . ($w ? ' WHERE ' . implode(' AND ', $w) : '') . " ORDER BY j.entry_id DESC LIMIT 200");
+        $st->execute($p); $entries = $st->fetchAll();
+
+        $fSections = $pdo->query("SELECT s.section_id, s.section_name, c.course_code FROM sections s JOIN courses c ON c.course_id=s.course_id ORDER BY c.course_code, s.section_name")->fetchAll();
+        $q = $pdo->prepare("SELECT g.group_id, g.group_name, s.section_name FROM student_groups g JOIN sections s ON s.section_id=g.section_id WHERE (?=0 OR g.section_id=?) ORDER BY s.section_name, g.group_name");
+        $q->execute([$fSec, $fSec]); $fGroups = $q->fetchAll();
+        $q = $pdo->prepare("SELECT u.user_id, u.name FROM users u JOIN enrollments e ON e.student_id=u.user_id
+            WHERE u.role='Student' AND (?=0 OR e.section_id=?) AND (?=0 OR e.group_id=?) ORDER BY u.name");
+        $q->execute([$fSec, $fSec, $fGrp, $fGrp]); $fStudents = $q->fetchAll();
+    } catch (PDOException $e) {
+        flash('warn', 'Filters unavailable (' . $e->getMessage() . '). Showing all entries.');
+        $entries = recent_journal_entries($pdo, 50, $role === 'Student' ? $userId : null);
+    }
+}
+$pendingCount = 0;
+foreach ($entries as $e0) if (empty($e0['review_status']) || $e0['review_status'] === 'Pending') $pendingCount++;
+function review_pill($s) {
+    $s = $s ?: 'Pending';
+    $cls = $s === 'Approved' ? 'ok' : ($s === 'Needs Revision' ? 'warn' : 'neutral');
+    return '<span class="pill ' . $cls . '">' . h($s === 'Pending' ? 'Not yet reviewed' : $s) . '</span>';
+}
 $lines   = journal_lines_for($pdo, array_column($entries, 'entry_id'));
 // No entries left (e.g. all deleted): reset the saved heading so the page starts fresh.
-if (!$entries) unset($_SESSION['je_company'], $_SESSION['je_report'], $_SESSION['je_period']);
+reset_reports_if_empty($pdo);
 $company = $_SESSION['je_company'] ?? '';
 $report  = $_SESSION['je_report']  ?? 'Chart of Accounts';
 $period  = $_SESSION['je_period']  ?? date('Y-m-t');
@@ -315,6 +623,7 @@ function je_block($i) { ?>
   </div>
 <?php } ?>
 
+<?php if ($canJournal): ?>
 <datalist id="acctList">
 <?php foreach ($accounts as $a): ?><option value="<?=h($a['account_name'])?>"><?=h($a['account_code'])?></option><?php endforeach; ?>
 </datalist>
@@ -339,6 +648,34 @@ function je_block($i) { ?>
 </form></div></section>
 
 <template id="blockTpl"><?php je_block('__i__'); ?></template>
+<?php else: ?>
+<p class="small muted" style="margin-bottom:12px">Faculty can check student journal entries (filter by section, group or student, then use Review to approve or send back with comments) but cannot add or delete entries.</p>
+<?php endif; ?>
+
+<?php if ($canReview): ?>
+<form method="get" style="margin-bottom:12px">
+  <input type="hidden" name="v" value="journal">
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+    <div style="min-width:170px"><label class="field-label">Section</label>
+      <select name="sec" onchange="this.form.grp.value=0;this.form.stu.value=0;this.form.submit()">
+        <option value="0">All sections</option>
+        <?php foreach ($fSections as $s): ?><option value="<?=(int)$s['section_id']?>"<?=$fSec === (int)$s['section_id'] ? ' selected' : ''?>><?=h($s['section_name'] . ' (' . $s['course_code'] . ')')?></option><?php endforeach; ?>
+      </select></div>
+    <div style="min-width:170px"><label class="field-label">Group</label>
+      <select name="grp" onchange="this.form.stu.value=0;this.form.submit()">
+        <option value="0">All groups</option>
+        <?php foreach ($fGroups as $g): ?><option value="<?=(int)$g['group_id']?>"<?=$fGrp === (int)$g['group_id'] ? ' selected' : ''?>><?=h($g['section_name'] . ' — ' . $g['group_name'])?></option><?php endforeach; ?>
+      </select></div>
+    <div style="min-width:170px"><label class="field-label">Student</label>
+      <select name="stu" onchange="this.form.submit()">
+        <option value="0">All students</option>
+        <?php foreach ($fStudents as $s): ?><option value="<?=(int)$s['user_id']?>"<?=$fStu === (int)$s['user_id'] ? ' selected' : ''?>><?=h($s['name'])?></option><?php endforeach; ?>
+      </select></div>
+    <?php if ($fSec || $fGrp || $fStu): ?><a class="btn ghost small" href="accounting.php?v=journal">Clear filter</a><?php endif; ?>
+  </div>
+  <p class="small muted" style="margin:8px 0 0"><?=count($entries)?> entr<?=count($entries) === 1 ? 'y' : 'ies'?> shown · <?=$pendingCount?> not yet reviewed</p>
+</form>
+<?php endif; ?>
 
 <section class="block">
   <div style="text-align:center;margin-bottom:10px">
@@ -348,15 +685,33 @@ function je_block($i) { ?>
     <h2 style="margin-top:8px">GENERAL JOURNAL <span class="tag"><?=count($entries)?> shown</span></h2>
   </div>
 <?php if (!$entries): ?><div class="empty">No journal entries yet.</div><?php else:
-  table_open(['Date','Account Titles and Explanation','Debit (₱)','Credit (₱)'], [0,0,1,1]);
-  foreach ($entries as $e):
+  $byStudent = [];
+  foreach ($entries as $e) $byStudent[$e['student_id']][] = $e;   // one block per student
+  foreach ($byStudent as $stuEntries):
+    $f = $stuEntries[0]; ?>
+  <div style="text-align:left;margin:18px 0 6px;line-height:1.6">
+    <div><b>Name:</b> <?=h($f['name'])?></div>
+    <div><b>Section:</b> <?=h(!empty($f['section_name']) ? $f['section_name'] : 'Not enlisted')?><?php if (!empty($f['group_name'])): ?> &nbsp;·&nbsp; <b>Group:</b> <?=h($f['group_name'])?><?php endif; ?></div>
+  </div>
+<?php table_open(['Date','Account Titles and Explanation','Debit (₱)','Credit (₱)'], [0,0,1,1]);
+  foreach ($stuEntries as $e):
     [$title, $expl] = je_split($e['description']);
     $ls = $lines[$e['entry_id']] ?? []; ?>
     <tr>
       <td><b><?=h(je_date_label($e['entry_date']))?></b></td>
-      <td><b><?=h($title)?></b> <span class="small muted">— <?=h($e['name'])?></span></td>
+      <td><b><?=h($title)?></b></td>
       <td colspan="2" style="text-align:right">
-        <?=pill($e['ai_validation_status'])?>
+        <?=pill($e['ai_validation_status'])?> <?=review_pill($e['review_status'] ?? '')?>
+        <?php if ($canReview): ?>
+        <button type="button" class="btn brass small"
+          data-id="<?=(int)$e['entry_id']?>" data-status="<?=h($e['review_status'] ?? 'Pending')?>" data-comment="<?=h($e['review_comment'] ?? '')?>"
+          data-student="<?=h($e['name'])?>" onclick="openReview(this)">Review</button>
+        <?php endif; ?>
+        <?php if ($canJournal): ?>
+        <button type="button" class="btn ghost small" onclick="editEntry(this)" data-entry="<?=h(json_encode([
+            'id' => (int)$e['entry_id'], 'date' => $e['entry_date'], 'title' => $title, 'expl' => $expl,
+            'lines' => array_map(function ($l) { return ['a' => $l['account_name'], 'd' => (float)$l['debit_amount'], 'c' => (float)$l['credit_amount']]; }, $ls)
+          ], JSON_UNESCAPED_UNICODE))?>">Edit</button>
         <form method="post" style="display:inline" onsubmit="return confirm('Delete this journal entry? This cannot be undone.')">
           <input type="hidden" name="csrf" value="<?=h(csrf())?>">
           <input type="hidden" name="action" value="delete_entry">
@@ -364,6 +719,7 @@ function je_block($i) { ?>
           <input type="hidden" name="entry_id" value="<?=(int)$e['entry_id']?>">
           <button class="btn ghost small">Delete</button>
         </form>
+        <?php endif; ?>
       </td>
     </tr>
     <?php foreach ($ls as $l): $isCredit = $l['credit_amount'] > 0 && !($l['debit_amount'] > 0); ?>
@@ -376,11 +732,91 @@ function je_block($i) { ?>
     <?php endforeach; ?>
     <?php if ($expl !== ''): ?>
     <tr><td></td><td colspan="3" style="padding-left:12px"><i><?=h($expl)?></i></td></tr>
+    <?php endif; ?>
+    <?php if (!empty($e['review_comment'])): ?>
+    <tr><td></td><td colspan="3" style="padding-left:12px"><b>Faculty feedback:</b> <?=nl2br(h($e['review_comment']))?></td></tr>
     <?php endif;
   endforeach;
   table_close(4);
+  endforeach;
 endif; ?>
 </section>
+
+<?php if ($canJournal): ?>
+<dialog id="editEntryDlg" class="modal" style="max-width:760px">
+  <h3>Edit journal entry</h3>
+  <form method="post" class="form-grid cols-1">
+    <input type="hidden" name="csrf" value="<?=h(csrf())?>"><input type="hidden" name="action" value="edit_entry"><input type="hidden" name="v" value="journal">
+    <input type="hidden" name="entry_id" id="eeId">
+    <div><label class="field-label">Date</label><?php dmy_input('entry_date', date('Y-m-d')); ?></div>
+    <div><label class="field-label">Entry title</label><input name="title" id="eeTitle" required></div>
+    <div class="je-block">
+      <div class="je-lines" id="eeLines"></div>
+      <button type="button" class="btn ghost small" style="margin-top:8px" onclick="addEditLine(null)">+ Add line</button>
+      <div class="je-totals"></div>
+      <div class="je-banner"></div>
+    </div>
+    <div><label class="field-label">Explanation</label><input name="explanation" id="eeExpl"></div>
+    <p class="small muted" style="margin:0">Saving re-checks that debits equal credits. An edited entry goes back to "not yet reviewed" for faculty.</p>
+    <div class="actions"><button type="button" class="btn ghost" onclick="this.closest('dialog').close()">Cancel</button><button class="btn brass">Save changes</button></div>
+  </form>
+</dialog>
+<script>
+function addEditLine(l){
+  var r = document.createElement('div'); r.className = 'je-line';
+  r.innerHTML = '<div><label class="field-label">Account title</label><input type="text" name="account[]" list="acctList" autocomplete="off"></div>'
+    + '<div><label class="field-label">Debit (₱)</label><input type="text" class="amt" inputmode="decimal" autocomplete="off" placeholder="0.00" name="debit[]" oninput="updateTotals(this)"></div>'
+    + '<div><label class="field-label">Credit (₱)</label><input type="text" class="amt" inputmode="decimal" autocomplete="off" placeholder="0.00" name="credit[]" oninput="updateTotals(this)"></div>'
+    + '<div><button type="button" class="btn ghost small" onclick="removeEditLine(this)">Remove</button></div>';
+  var f = r.querySelectorAll('input');
+  if (l) { f[0].value = l.a; f[1].value = l.d > 0 ? fmtAmt(l.d) : ''; f[2].value = l.c > 0 ? fmtAmt(l.c) : ''; }
+  document.getElementById('eeLines').appendChild(r);
+}
+function removeEditLine(btn){
+  var w = document.getElementById('eeLines');
+  if (w.children.length > 2) { btn.closest('.je-line').remove(); updateTotals(w.querySelector('input')); }
+}
+function editEntry(btn){
+  var d = JSON.parse(btn.dataset.entry), w = document.getElementById('eeLines');
+  document.getElementById('eeId').value = d.id;
+  document.getElementById('eeTitle').value = d.title;
+  document.getElementById('eeExpl').value = d.expl;
+  dmySet(document.querySelector('#editEntryDlg .dmy'), d.date);
+  w.innerHTML = '';
+  d.lines.forEach(addEditLine);
+  while (w.children.length < 2) addEditLine(null);
+  updateTotals(w.querySelector('input'));
+  document.getElementById('editEntryDlg').showModal();
+}
+</script>
+<?php endif; ?>
+
+<?php if ($canReview): ?>
+<dialog id="reviewDlg" class="modal"><h3>Review journal entry</h3>
+<form method="post" class="form-grid cols-1">
+  <input type="hidden" name="csrf" value="<?=h(csrf())?>"><input type="hidden" name="action" value="review_entry"><input type="hidden" name="v" value="journal">
+  <input type="hidden" name="entry_id" id="rvId">
+  <input type="hidden" name="sec" value="<?=$fSec?>"><input type="hidden" name="grp" value="<?=$fGrp?>"><input type="hidden" name="stu" value="<?=$fStu?>">
+  <p class="small muted" style="margin:0">Student: <b id="rvStudent"></b></p>
+  <div><label class="field-label">Result</label>
+    <select name="review_status" id="rvStatus">
+      <option value="Approved">Approved — entry is correct</option>
+      <option value="Needs Revision">Needs revision — send back to student</option>
+      <option value="Pending">Not yet reviewed (clear review)</option>
+    </select></div>
+  <div><label class="field-label">Comment (required when sending back)</label><textarea name="review_comment" id="rvComment" placeholder="e.g. Check the account used for the credit line."></textarea></div>
+  <div class="actions"><button type="button" class="btn ghost" onclick="this.closest('dialog').close()">Cancel</button><button class="btn brass">Save review</button></div>
+</form></dialog>
+<script>
+function openReview(btn){
+  document.getElementById('rvId').value = btn.dataset.id;
+  document.getElementById('rvStudent').textContent = btn.dataset.student;
+  document.getElementById('rvStatus').value = btn.dataset.status || 'Pending';
+  document.getElementById('rvComment').value = btn.dataset.comment || '';
+  document.getElementById('reviewDlg').showModal();
+}
+</script>
+<?php endif; ?>
 
 <style>
 .dmy{position:relative;display:block}

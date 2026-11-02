@@ -88,10 +88,19 @@ function journal_is_balanced(array $debits, array $credits) {
 }
 
 // Accepts an account code, an account name, or "101 - Cash" (datalist format).
-function find_account(PDO $pdo, $input) {
+function find_account(PDO $pdo, $input, $ownerId = null) {
     $input = trim((string)$input);
     if ($input === '') return null;
     $code = trim(explode(' - ', $input, 2)[0]);
+    if ($ownerId) {   // each student has their own chart of accounts (plus shared starter accounts with no owner)
+        try {
+            $stmt = $pdo->prepare("SELECT account_id FROM chart_of_accounts WHERE (account_code=? OR LOWER(account_name)=LOWER(?))
+                AND (created_by=? OR created_by IS NULL) ORDER BY (created_by IS NULL), account_id LIMIT 1");
+            $stmt->execute([$code, $input, (int)$ownerId]);
+            $id = $stmt->fetchColumn();
+            return $id === false ? null : (int)$id;
+        } catch (PDOException $e) { /* created_by column not added yet: use the shared lookup below */ }
+    }
     $stmt = $pdo->prepare("SELECT account_id FROM chart_of_accounts WHERE account_code=? OR LOWER(account_name)=LOWER(?) LIMIT 1");
     $stmt->execute([$code, $input]);
     $id = $stmt->fetchColumn();
@@ -105,7 +114,7 @@ function save_journal_entry(PDO $pdo, $studentId, $date, $desc, array $accounts,
         $d = (float)($debits[$i] ?? 0);
         $c = (float)($credits[$i] ?? 0);
         if (trim((string)$raw) === '' && $d == 0 && $c == 0) continue; // skip blank rows
-        $id = find_account($pdo, $raw);
+        $id = find_account($pdo, $raw, $studentId);
         if ($id === null) {
             return ['ok'=>false, 'valid'=>false, 'message'=>'Account not found: ' . trim((string)$raw) . '. Use a code or title from the Chart of Accounts.'];
         }
@@ -157,16 +166,18 @@ function journal_lines_for(PDO $pdo, array $entryIds) {
 }
 
 // Balance of every account from VALID (balanced) entries, on its normal side.
-function account_balances(PDO $pdo) {
+function account_balances(PDO $pdo, $studentId = null) {
     $sql = "SELECT a.account_id, a.account_code, a.account_name, a.account_type,
                    COALESCE(SUM(l.debit_amount),0) dr, COALESCE(SUM(l.credit_amount),0) cr
             FROM chart_of_accounts a
             LEFT JOIN (SELECT jl.account_id, jl.debit_amount, jl.credit_amount
                        FROM journal_lines jl JOIN journal_entries je ON je.entry_id=jl.entry_id
-                       WHERE je.ai_validation_status='Valid') l ON l.account_id=a.account_id
+                       WHERE je.ai_validation_status='Valid'" . ($studentId ? " AND je.student_id=?" : "") . ") l ON l.account_id=a.account_id
             GROUP BY a.account_id, a.account_code, a.account_name, a.account_type
             ORDER BY a.account_code";
-    $rows = $pdo->query($sql)->fetchAll();
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($studentId ? [(int)$studentId] : []);
+    $rows = $stmt->fetchAll();
     foreach ($rows as &$r) {
         $debitNormal = in_array($r['account_type'], ['Asset','Expense'], true);
         $r['balance'] = $debitNormal ? (float)$r['dr'] - (float)$r['cr'] : (float)$r['cr'] - (float)$r['dr'];
@@ -178,6 +189,37 @@ function sum_by_type(array $balances, $type) {
     $t = 0;
     foreach ($balances as $b) if ($b['account_type'] === $type) $t += $b['balance'];
     return $t;
+}
+
+
+// Which student's data the reports/journal show: a Student sees only their own
+// entries; Admin and Faculty see everyone's (null = no filter).
+function report_scope_student() {
+    return (($_SESSION['user']['role'] ?? '') === 'Student') ? (int)$_SESSION['user']['user_id'] : null;
+}
+
+// Number of journal entries in the current scope.
+function journal_entry_count(PDO $pdo, $studentId = null) {
+    if ($studentId) {
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM journal_entries WHERE student_id=?");
+        $stmt->execute([(int)$studentId]);
+        return (int)$stmt->fetchColumn();
+    }
+    return (int)$pdo->query("SELECT COUNT(*) FROM journal_entries")->fetchColumn();
+}
+
+// Clears every saved heading/textbox value used by the journal and the reports
+// (General Ledger, Trial Balance, Financial Reports) so they start fresh.
+function reset_report_state() {
+    foreach (array_keys($_SESSION) as $k) {
+        if (preg_match('/^(je|gl|ledger|tb|trial|fs|fin|rpt|report)_/', $k)) unset($_SESSION[$k]);
+    }
+}
+
+// Call at the top of reports.php and after deleting entries:
+// if no journal entries exist, the reports go back to a blank state.
+function reset_reports_if_empty(PDO $pdo) {
+    if (journal_entry_count($pdo, report_scope_student()) === 0) reset_report_state();
 }
 
 function peso($n) { return ($n < 0 ? '-' : '') . '₱' . number_format(abs((float)$n), 2); }

@@ -1,8 +1,10 @@
 <?php
 require 'config.php'; require 'layout.php'; require_login();
+reset_reports_if_empty($pdo);
 $v = $_GET['v'] ?? 'ledger';
 if (!in_array($v, ['ledger','trial','financial'], true)) $v = 'ledger';
-$balances = account_balances($pdo);
+$scope = report_scope_student(); // Students see only their own entries, same as the Journal page
+$balances = account_balances($pdo, $scope);
 
 if ($v === 'trial') {
     $tb = []; $totD = $totC = 0;
@@ -93,7 +95,11 @@ if ($v === 'financial') {
     $net = $revenue - $expense;
     $assets = sum_by_type($balances, 'Asset'); $liab = sum_by_type($balances, 'Liability');
     $equity = sum_by_type($balances, 'Equity') + $net;
-    layout_start('reports', 'Financial Reports', 'Income statement and balance sheet, generated from posted (balanced) journal entries.'); ?>
+    layout_start('reports', 'Financial Reports', 'Income statement and balance sheet, generated from posted (balanced) journal entries.');
+if (journal_entry_count($pdo, $scope) === 0 || !array_filter($balances, fn($b) => abs($b['balance']) >= 0.005)) {
+    echo '<div class="empty">No balanced journal entries have been posted yet.</div>';
+    layout_end(); exit;
+} ?>
 <section class="block"><h2>Income Statement</h2><div class="card">
   <div class="flex-between"><span>Total revenue</span><b class="num"><?=h(peso($revenue))?></b></div>
   <div class="flex-between"><span>Total expenses</span><b class="num"><?=h(peso($expense))?></b></div>
@@ -113,7 +119,7 @@ if ($v === 'financial') {
 // ---- General ledger ----
 $rows = $pdo->query("SELECT a.account_id, j.entry_date, j.description, l.debit_amount, l.credit_amount
     FROM journal_lines l JOIN journal_entries j ON j.entry_id=l.entry_id JOIN chart_of_accounts a ON a.account_id=l.account_id
-    WHERE j.ai_validation_status='Valid' ORDER BY j.entry_date, j.entry_id, l.line_id")->fetchAll();
+    WHERE j.ai_validation_status='Valid'" . ($scope ? " AND j.student_id=" . (int)$scope : "") . " ORDER BY j.entry_date, j.entry_id, l.line_id")->fetchAll();
 $byAcc = [];
 foreach ($rows as $r) if ($r['debit_amount'] > 0 || $r['credit_amount'] > 0) $byAcc[$r['account_id']][] = $r;
 layout_start('ledger', 'General Ledger', 'Balanced journal entries posted automatically to each account.');

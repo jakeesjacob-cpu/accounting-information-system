@@ -14,14 +14,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!$exists->fetchColumn()) flash('warn', 'Choose a section.');
             elseif (!$ids) flash('warn', 'Select at least one student to enlist.');
             else {
+                // Works with or without a UNIQUE key on enrollments.student_id:
+                // new student -> INSERT, already in another section -> move (group is cleared), same section -> skip.
                 $isStudent = $pdo->prepare("SELECT COUNT(*) FROM users WHERE user_id=? AND role='Student'");
-                $ins = $pdo->prepare("INSERT INTO enrollments(student_id,section_id) VALUES(?,?) ON DUPLICATE KEY UPDATE section_id=VALUES(section_id), group_id=NULL");
-                $n = 0;
-                foreach ($ids as $sid) {
-                    $isStudent->execute([$sid]);
-                    if ($isStudent->fetchColumn()) { $ins->execute([$sid, $secId]); $n++; }
+                $cur = $pdo->prepare("SELECT enrollment_id, section_id FROM enrollments WHERE student_id=? LIMIT 1");
+                // Older databases have enrollments.course_id (foreign key to courses). If it exists, fill it from the section's program.
+                $hasCourseCol = (bool)$pdo->query("SHOW COLUMNS FROM enrollments LIKE 'course_id'")->fetch();
+                $secCourse = $pdo->prepare("SELECT course_id FROM sections WHERE section_id=?"); $secCourse->execute([$secId]);
+                $courseId = (int)$secCourse->fetchColumn();
+                if ($hasCourseCol) {
+                    $ins = $pdo->prepare("INSERT INTO enrollments(student_id,section_id,course_id) VALUES(?,?,$courseId)");
+                    $mv  = $pdo->prepare("UPDATE enrollments SET section_id=?, course_id=$courseId, group_id=NULL WHERE enrollment_id=?");
+                } else {
+                    $ins = $pdo->prepare("INSERT INTO enrollments(student_id,section_id) VALUES(?,?)");
+                    $mv  = $pdo->prepare("UPDATE enrollments SET section_id=?, group_id=NULL WHERE enrollment_id=?");
                 }
-                audit($pdo, "Enlisted $n student(s) to a section"); flash('ok', "$n student(s) enlisted.");
+                $n = 0; $moved = 0;
+                foreach ($ids as $sid) {
+                    if ($sid <= 0) continue;
+                    $isStudent->execute([$sid]);
+                    if (!$isStudent->fetchColumn()) continue;
+                    $cur->execute([$sid]); $row = $cur->fetch(); $cur->closeCursor();
+                    if (!$row) { $ins->execute([$sid, $secId]); $n++; }
+                    elseif ((int)$row['section_id'] !== $secId) { $mv->execute([$secId, $row['enrollment_id']]); $n++; $moved++; }
+                }
+                audit($pdo, "Enlisted $n student(s) to a section");
+                if ($n === 0) flash('warn', 'The selected students are already in that section.');
+                else flash('ok', "$n student(s) enlisted" . ($moved ? " ($moved moved from another section)." : '.'));
                 $back = $secId;
             }
         } elseif ($action === 'unenlist') {
@@ -65,16 +84,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             audit($pdo, 'Deleted student group'); flash('ok', 'Group deleted.');
         }
     } catch (PDOException $e) {
-        flash('warn', $e->getCode() === '23000' ? 'That group name already exists in this section.' : 'Database error. Did you run migration_faculty_features.sql?');
+        flash('warn', ($e->getCode() === '23000' && $action === 'add_group') ? 'That group name already exists in this section.' : 'Database error: ' . $e->getMessage());
     }
     header('Location: students.php' . ($back ? '?sec=' . $back : '')); exit;
 }
 
-$sections = $unenlisted = $enr = $groups = [];
+$sections = $candidates = $enr = $groups = [];
 try {
     $sections = $pdo->query("SELECT s.*, c.course_code FROM sections s JOIN courses c ON c.course_id=s.course_id ORDER BY c.course_code, s.section_name")->fetchAll();
-    $unenlisted = $pdo->query("SELECT user_id,name FROM users WHERE role='Student' AND status='Active'
-        AND user_id NOT IN (SELECT student_id FROM enrollments) ORDER BY name")->fetchAll();
+    // Every active student, not-yet-enlisted first; enlisted ones show their current section (and can be moved).
+    $candidates = $pdo->query("SELECT u.user_id, u.name, sec.section_name, e.enrollment_id
+        FROM users u LEFT JOIN enrollments e ON e.student_id=u.user_id LEFT JOIN sections sec ON sec.section_id=e.section_id
+        WHERE u.role='Student' AND COALESCE(u.status,'Active')='Active'
+        ORDER BY (e.enrollment_id IS NOT NULL), u.name")->fetchAll();
     $st = $pdo->prepare("SELECT e.*, u.name, u.email, sec.section_name, c.course_code, g.group_name
         FROM enrollments e JOIN users u ON u.user_id=e.student_id JOIN sections sec ON sec.section_id=e.section_id
         JOIN courses c ON c.course_id=sec.course_id LEFT JOIN student_groups g ON g.group_id=e.group_id
@@ -85,7 +107,7 @@ try {
         WHERE (? = 0 OR g.section_id = ?) ORDER BY sec.section_name, g.group_name");
     $gs->execute([$secFilter, $secFilter]); $groups = $gs->fetchAll();
 } catch (PDOException $e) {
-    flash('warn', 'Student management is not set up yet. Run migration_faculty_features.sql first.');
+   flash('warn', 'Setup error: ' . $e->getMessage());
 }
 $groupsBySec = [];
 foreach ($groups as $g) $groupsBySec[$g['section_id']][] = $g;
@@ -143,10 +165,13 @@ foreach ($enr as $e): ?>
   <input type="hidden" name="csrf" value="<?=h(csrf())?>"><input type="hidden" name="action" value="enlist">
   <div><label class="field-label">Section</label><select name="section_id" required>
     <?php foreach ($sections as $s): ?><option value="<?=(int)$s['section_id']?>"<?=$secFilter === (int)$s['section_id'] ? ' selected' : ''?>><?=h($s['section_name'] . ' (' . $s['course_code'] . ')')?></option><?php endforeach; ?></select></div>
-  <div><label class="field-label">Students not yet enlisted</label>
-    <div style="max-height:220px;overflow:auto;border:1px solid var(--line, #ccc);border-radius:6px;padding:8px">
-    <?php foreach ($unenlisted as $u): ?><label style="display:block;padding:3px 0"><input type="checkbox" name="student_ids[]" value="<?=(int)$u['user_id']?>" style="width:auto"> <?=h($u['name'])?></label><?php endforeach; ?>
-    <?php if (!$unenlisted): ?><span class="muted small">All active students are already enlisted.</span><?php endif; ?></div></div>
+  <?php if (!$sections): ?><div class="banner warn">No sections yet. Add a class (with a section) in Program Management first.</div><?php endif; ?>
+  <div><label class="field-label">Students</label>
+    <input type="search" id="enlistSearch" placeholder="Search students..." autocomplete="off" style="margin-bottom:6px">
+    <div style="margin-bottom:6px"><button type="button" class="btn ghost small" onclick="enlistPick(true)">Select shown</button> <button type="button" class="btn ghost small" onclick="enlistPick(false)">Clear</button></div>
+    <div style="max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:8px">
+    <?php foreach ($candidates as $u): ?><label class="enlistRow" data-name="<?=h(strtolower($u['name']))?>" style="display:block;padding:3px 0"><input type="checkbox" name="student_ids[]" value="<?=(int)$u['user_id']?>" style="width:auto"> <?=h($u['name'])?><?php if ($u['enrollment_id']): ?> <span class="muted small">— now in <?=h($u['section_name'])?> (will be moved)</span><?php endif; ?></label><?php endforeach; ?>
+    <?php if (!$candidates): ?><span class="muted small">No active student accounts. Add students in User Management first.</span><?php endif; ?></div></div>
   <div class="actions"><button type="button" class="btn ghost" onclick="this.closest('dialog').close()">Cancel</button><button class="btn brass">Enlist</button></div></form></dialog>
 
 <dialog id="groupDlg" class="modal"><h3>New group</h3><form method="post" class="form-grid cols-1">
@@ -155,4 +180,13 @@ foreach ($enr as $e): ?>
     <?php foreach ($sections as $s): ?><option value="<?=(int)$s['section_id']?>"<?=$secFilter === (int)$s['section_id'] ? ' selected' : ''?>><?=h($s['section_name'] . ' (' . $s['course_code'] . ')')?></option><?php endforeach; ?></select></div>
   <div><label class="field-label">Group name</label><input name="group_name" required placeholder="e.g. Group 1"></div>
   <div class="actions"><button type="button" class="btn ghost" onclick="this.closest('dialog').close()">Cancel</button><button class="btn brass">Create group</button></div></form></dialog>
+<script>
+document.getElementById('enlistSearch').addEventListener('input', function(){
+  var q = this.value.toLowerCase();
+  document.querySelectorAll('.enlistRow').forEach(function(r){ r.style.display = r.dataset.name.indexOf(q) > -1 ? 'block' : 'none'; });
+});
+function enlistPick(on){
+  document.querySelectorAll('.enlistRow').forEach(function(r){ if (r.style.display !== 'none') r.querySelector('input').checked = on; });
+}
+</script>
 <?php layout_end(); ?>
