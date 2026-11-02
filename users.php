@@ -17,6 +17,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ->execute([$name, $email, password_hash($pass, PASSWORD_DEFAULT), $role, base64_encode(random_bytes(16))]);
                 audit($pdo, "Created user $email ($role)"); flash('ok', "$name was added as " . role_label($role) . '.');
             }
+        } elseif ($action === 'approve_user') {
+            $uid = (int)($_POST['user_id'] ?? 0);
+            $stmt = $pdo->prepare("SELECT email FROM users WHERE user_id=? AND status='Pending' AND role='Student'");
+            $stmt->execute([$uid]); $u = $stmt->fetch();
+            if (!$u) flash('warn', 'That registration is no longer pending.');
+            else {
+                $pdo->prepare("UPDATE users SET status='Active' WHERE user_id=?")->execute([$uid]);
+                audit($pdo, 'Approved student registration ' . $u['email']);
+                flash('ok', $u['email'] . ' was approved and can now log in.');
+            }
+        } elseif ($action === 'reject_user') {
+            $uid = (int)($_POST['user_id'] ?? 0);
+            $stmt = $pdo->prepare("SELECT email FROM users WHERE user_id=? AND status='Pending' AND role='Student'");
+            $stmt->execute([$uid]); $u = $stmt->fetch();
+            if (!$u) flash('warn', 'That registration is no longer pending.');
+            else {
+                $pdo->prepare("DELETE FROM users WHERE user_id=?")->execute([$uid]);
+                audit($pdo, 'Rejected student registration ' . $u['email']);
+                flash('ok', 'Registration of ' . $u['email'] . ' was rejected and removed.');
+            }
         } elseif ($action === 'delete_user') {
             $uid = (int)($_POST['user_id'] ?? 0);
             $stmt = $pdo->prepare("SELECT email,role FROM users WHERE user_id=?"); $stmt->execute([$uid]); $u = $stmt->fetch();
@@ -52,8 +72,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     header('Location: users.php'); exit;
 }
-$users = $pdo->query("SELECT user_id,name,email,role,status FROM users ORDER BY user_id")->fetchAll();
+$users = $pdo->query("SELECT user_id,name,email,role,status FROM users ORDER BY (status='Pending') DESC, user_id")->fetchAll();
+$pendingCount = count(array_filter($users, function ($x) { return $x['status'] === 'Pending'; }));
 layout_start('users', 'User Management', 'Administrator, Instructor, and Student accounts.'); ?>
+<?php if ($pendingCount): ?><div class="banner warn" style="margin-bottom:12px"><?=$pendingCount?> student registration<?=$pendingCount > 1 ? 's are' : ' is'?> waiting for your approval (shown at the top of the list).</div><?php endif; ?>
 <div class="flex-between" style="margin-bottom:12px">
   <input type="text" id="userSearch" placeholder="Search users..." style="max-width:240px" onkeyup="filterUsers()">
   <button class="btn brass" onclick="openUserDlg()">+ New user</button>
@@ -61,7 +83,10 @@ layout_start('users', 'User Management', 'Administrator, Instructor, and Student
 <div id="userWrap"><?php table_open(['Name','Email','Role','Status',''], [0,0,0,0,0]);
 foreach ($users as $u): ?>
   <tr><td><?=h($u['name'])?></td><td><?=h($u['email'])?></td><td><?=h(role_label($u['role']))?></td><td><?=pill($u['status'])?></td>
-  <td><?php if ((int)$u['user_id'] !== $selfId): ?><form method="post"><input type="hidden" name="csrf" value="<?=h(csrf())?>"><input type="hidden" name="action" value="toggle_user"><input type="hidden" name="user_id" value="<?=(int)$u['user_id']?>"><button class="btn ghost small"><?=$u['status'] === 'Active' ? 'Disable' : 'Enable'?></button></form>
+  <td><?php if ($u['status'] === 'Pending'): ?>
+    <form method="post" style="display:inline"><input type="hidden" name="csrf" value="<?=h(csrf())?>"><input type="hidden" name="action" value="approve_user"><input type="hidden" name="user_id" value="<?=(int)$u['user_id']?>"><button class="btn brass small">Approve</button></form>
+    <form method="post" style="display:inline" onsubmit="return confirm('Reject and remove this registration?')"><input type="hidden" name="csrf" value="<?=h(csrf())?>"><input type="hidden" name="action" value="reject_user"><input type="hidden" name="user_id" value="<?=(int)$u['user_id']?>"><button class="btn ghost small">Reject</button></form>
+  <?php elseif ((int)$u['user_id'] !== $selfId): ?><form method="post"><input type="hidden" name="csrf" value="<?=h(csrf())?>"><input type="hidden" name="action" value="toggle_user"><input type="hidden" name="user_id" value="<?=(int)$u['user_id']?>"><button class="btn ghost small"><?=$u['status'] === 'Active' ? 'Disable' : 'Enable'?></button></form>
     <form method="post" style="display:inline" onsubmit="return confirm('Delete this user permanently?')"><input type="hidden" name="csrf" value="<?=h(csrf())?>"><input type="hidden" name="action" value="delete_user"><input type="hidden" name="user_id" value="<?=(int)$u['user_id']?>"><button class="btn ghost small">Delete</button></form><?php endif; ?></td></tr>
 <?php endforeach; table_close(5); ?></div>
 <dialog id="userDlg" class="modal"><h3>New user</h3>

@@ -21,6 +21,7 @@ if ($role !== 'Admin') {
     $avg = $pcts ? array_sum($pcts) / count($pcts) : null;
 } else {
     $roleCounts = $pdo->query("SELECT role, COUNT(*) FROM users GROUP BY role")->fetchAll(PDO::FETCH_KEY_PAIR);
+    $pendingUsers = (int)$pdo->query("SELECT COUNT(*) FROM users WHERE status='Pending'")->fetchColumn();
 }
 
 layout_start('dashboard', 'Dashboard',
@@ -47,5 +48,6 @@ layout_start('dashboard', 'Dashboard',
 <div class="grid cols-3">
 <?php foreach (['Admin'=>'Administrators','Faculty'=>'Faculty','Student'=>'Students'] as $r => $label) stat_card($label, (int)($roleCounts[$r] ?? 0)); ?>
 </div></section>
+<?php if ($pendingUsers): ?><div class="banner warn">⏳ <?=$pendingUsers?> student registration<?=$pendingUsers > 1 ? 's' : ''?> pending approval. <a href="users.php">Review in User Management</a></div><?php endif; ?>
 <?php endif; ?>
 <?php layout_end(); ?>

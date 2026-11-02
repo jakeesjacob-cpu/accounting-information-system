@@ -15,7 +15,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $user = $stmt->fetch();
  
     if ($user && password_verify($password, $user['password'])) {
-        if (($user['status'] ?? 'Active') !== 'Active') {
+        $st = $user['status'] ?? 'Active';
+        if ($st === 'Pending') {
+            $error = 'Your registration is still waiting for administrator approval.';
+        } elseif ($st !== 'Active') {
             $error = 'This account is not active. Please contact the administrator.';
         } else {
             $expected = totp_code($user['two_factor_secret']);
@@ -76,6 +79,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 <input name="code" inputmode="numeric" maxlength="6" placeholder="123456" required>
 <button type="submit">Login</button>
 </form>
+<p style="text-align:center;margin:16px 0 0;font-size:14px">Student? <a href="register.php">Sign up here</a></p>
 </div>
 <script>
 document.getElementById('pwToggle').addEventListener('click', function () {
