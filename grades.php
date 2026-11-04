@@ -14,9 +14,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     header('Location: grades.php'); exit;
 }
-$sql = "SELECT g.*, u.name, COALESCE(a.title, s.title, 'Recorded grade') label, c.course_code
+$sql = "SELECT g.*, u.name, COALESCE(a.title, s.title, CONCAT('Journal entry: ', SUBSTRING_INDEX(j.description, ' ‖ ', 1)), IF(g.coa_student_id IS NOT NULL, 'Chart of Accounts', NULL), 'Recorded grade') label, c.course_code
         FROM grades g JOIN users u ON u.user_id=g.student_id JOIN courses c ON c.course_id=g.course_id
-        LEFT JOIN assignments a ON a.assignment_id=g.assignment_id LEFT JOIN assessments s ON s.assessment_id=g.assessment_id"
+        LEFT JOIN assignments a ON a.assignment_id=g.assignment_id LEFT JOIN assessments s ON s.assessment_id=g.assessment_id
+        LEFT JOIN journal_entries j ON j.entry_id=g.entry_id"
         . ($isStaff ? "" : " WHERE g.student_id=?") . " ORDER BY g.grade_id DESC";
 $stmt = $pdo->prepare($sql); $stmt->execute($isStaff ? [] : [$uid]); $grades = $stmt->fetchAll();
 if ($isStaff) {

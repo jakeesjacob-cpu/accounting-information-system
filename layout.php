@@ -11,7 +11,7 @@ function nav_config() {
         ['Accounting (AIS)', [
             ['coa',     'Chart of Accounts', '▤', 'accounting.php?v=coa',     $noAdmin],
             ['journal', 'Journal Entries',   '✎', 'accounting.php?v=journal', $noAdmin],
-            ['ledger',  'General Ledger',    '▥', 'reports.php?v=ledger',     $noAdmin],
+            ['ledger',  'General Ledger',    '▥', 'ledger.php',               $noAdmin],
             ['trial',   'Trial Balance',     '⚖', 'reports.php?v=trial',      $noAdmin],
             ['reports', 'Financial Reports', '▦', 'reports.php?v=financial',  $noAdmin],
         ]],

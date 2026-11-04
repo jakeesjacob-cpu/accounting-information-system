@@ -11,8 +11,8 @@ $totalAssets = sum_by_type(account_balances($pdo), 'Asset');
 $recent = recent_journal_entries($pdo, 5, $scope);
 
 if ($role !== 'Admin') {
-    $stmt = $pdo->prepare("SELECT g.*, COALESCE(a.title, s.title, 'Recorded grade') label
-        FROM grades g LEFT JOIN assignments a ON a.assignment_id=g.assignment_id LEFT JOIN assessments s ON s.assessment_id=g.assessment_id"
+    $stmt = $pdo->prepare("SELECT g.*, COALESCE(a.title, s.title, CONCAT('Journal entry: ', SUBSTRING_INDEX(j.description, ' ‖ ', 1)), IF(g.coa_student_id IS NOT NULL, 'Chart of Accounts', NULL), 'Recorded grade') label
+        FROM grades g LEFT JOIN assignments a ON a.assignment_id=g.assignment_id LEFT JOIN assessments s ON s.assessment_id=g.assessment_id LEFT JOIN journal_entries j ON j.entry_id=g.entry_id"
         . ($scope ? " WHERE g.student_id=?" : "") . " ORDER BY g.grade_id DESC LIMIT 10");
     $stmt->execute($scope ? [$scope] : []);
     $grades = $stmt->fetchAll();
